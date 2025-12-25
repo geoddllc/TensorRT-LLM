@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from .afmoe.model import AfmoeForCausalLM
 from .baichuan.model import BaichuanForCausalLM
 from .bert.model import (BertForQuestionAnswering,
                          BertForSequenceClassification, BertModel,
@@ -64,6 +65,7 @@ from .redrafter.model import ReDrafterForLLaMALM, ReDrafterForQWenLM
 from .stdit.model import STDiT3Model
 
 __all__ = [
+    'AfmoeForCausalLM',
     'BertModel',
     'BertForQuestionAnswering',
     'BertForSequenceClassification',
@@ -110,7 +112,7 @@ __all__ = [
     'ChatGLMForCausalLM',
     'ChatGLMModel',
     'BaichuanForCausalLM',
-    'QWenConfig'
+    'QWenConfig',
     'QWenForCausalLM',
     'QWenModel',
     'EncoderModel',
@@ -197,6 +199,7 @@ MODEL_MAP = {
     'Qwen2VLModel': QWenForCausalLM,
     'Qwen3ForCausalLM': QWenForCausalLM,
     'Qwen3MoeForCausalLM': QWenForCausalLM,
+    'AfmoeForCausalLM': AfmoeForCausalLM,
     'WhisperEncoder': WhisperEncoder,
     'EncoderModel': EncoderModel,
     'DecoderModel': DecoderModel,
