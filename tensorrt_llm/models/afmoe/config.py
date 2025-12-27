@@ -60,6 +60,7 @@ class AfmoeConfig(PretrainedConfig):
         # GQA configuration
         self.num_key_value_heads = num_key_value_heads
         self.head_dim = head_dim
+        self.embedding_scale = None
         
         # AFMoE specific parameters
         self.moe_intermediate_size = moe_intermediate_size
@@ -94,7 +95,8 @@ class AfmoeConfig(PretrainedConfig):
         self.layer_idx_offset = 0
         self.has_partial_lora_mask = False
 
-        super().__init__(**kwargs)
+        # Pass num_key_value_heads explicitly to parent to avoid it being overwritten
+        super().__init__(num_key_value_heads=num_key_value_heads, **kwargs)
 
     def to_dict(self):
         output = super().to_dict()
@@ -146,7 +148,15 @@ class AfmoeConfig(PretrainedConfig):
 
         # Extract AFMoE-specific configurations
         num_key_value_heads = getattr(hf_config, "num_key_value_heads", 32)
-        head_dim = getattr(hf_config, "head_dim", 64)
+        
+        # Calculate head_dim from hidden_size and num_attention_heads
+        hidden_size = getattr(hf_config, "hidden_size", 1024)
+        num_attention_heads_from_config = getattr(hf_config, "num_attention_heads", 16)
+        head_dim = hidden_size // num_attention_heads_from_config
+        
+        # Use the actual num_attention_heads from config (not calculated)
+        num_attention_heads = num_attention_heads_from_config
+        
         sliding_window = getattr(hf_config, "sliding_window", 2048)
         global_attn_every_n_layers = getattr(hf_config, "global_attn_every_n_layers", 4)
         layer_types = getattr(hf_config, "layer_types", [])
@@ -166,7 +176,7 @@ class AfmoeConfig(PretrainedConfig):
         seq_length = getattr(hf_config, "seq_length", 8192)
 
         # MoE configuration
-        moe_num_experts = getattr(hf_config, "num_local_experts", 0)
+        moe_num_experts = getattr(hf_config, "num_local_experts", getattr(hf_config, "num_experts", 0))
         moe_top_k = getattr(hf_config, "num_experts_per_tok", 0)
         moe_config = MoeConfig(num_experts=moe_num_experts,
                                top_k=moe_top_k,
@@ -180,7 +190,7 @@ class AfmoeConfig(PretrainedConfig):
             architecture=hf_config.architectures[0],
             dtype=dtype,
             num_hidden_layers=hf_config.num_hidden_layers,
-            num_attention_heads=hf_config.num_attention_heads,
+            num_attention_heads=hf_config.num_attention_heads,  # Use HF config value
             hidden_size=hf_config.hidden_size,
             intermediate_size=hf_config.intermediate_size,
             num_key_value_heads=num_key_value_heads,

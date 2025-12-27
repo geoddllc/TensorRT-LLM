@@ -93,25 +93,12 @@ def get_prefix_and_param_name_map(architecture, use_safetensors=False):
     if use_safetensors:
         key_postfix = ".weight"
 
-    # AFMoE uses similar naming to LLaMA but with different MoE structure
+    # AFMoE uses direct naming without model prefix
     model_prefix = "model"
     param_name_map = {
         "vocab_embedding": "embed_tokens" + key_postfix,  # vocab_embedding
         "lm_head": "lm_head" + key_postfix,  # lm_head
         "ln_f": "norm" + key_postfix,  # ln_f
-        "attention.qkv": "self_attn",  # attention.qkv
-        "qkv_suffix": "_proj" + key_postfix,  # qkv suffix
-        "attention.dense": "self_attn.o_proj" + key_postfix,  # attention.dense
-        "mlp.gate": "mlp.up_proj" + key_postfix,  # mlp.gate
-        "mlp.proj": "mlp.down_proj" + key_postfix,  # mlp.proj
-        "mlp.fc": "mlp.gate_proj" + key_postfix,  # mlp.fc
-        "input_layernorm": "input_layernorm" + key_postfix,  # input_layernorm
-        "post_layernorm": "post_attention_layernorm" + key_postfix,  # post_layernorm
-        # AFMoE specific
-        "moe_router": "block_sparse_moe.gate" + key_postfix,  # MoE router (never quantized)
-        "moe_shared_expert_gate": "block_sparse_moe.shared_expert_gate" + key_postfix,  # Shared expert gate
-        "moe_shared_expert_fc": "block_sparse_moe.shared_expert.up_proj" + key_postfix,  # Shared expert FC
-        "moe_shared_expert_proj": "block_sparse_moe.shared_expert.down_proj" + key_postfix,  # Shared expert proj
     }
     layer_prefix = 'layers'
 
@@ -133,44 +120,57 @@ def load_hf_afmoe(model_dir: str, load_model_on_cpu: bool = False):
 def validate_tensor_shapes(weights, config: AfmoeConfig):
     """Validate tensor shapes before saving to catch issues early"""
     logger.info("Validating tensor shapes...")
-    
+
     # Check expected shapes for key tensors
     expected_shapes = {
         'vocab_embedding.weight': (config.vocab_size, config.hidden_size),
         'lm_head.weight': (config.vocab_size, config.hidden_size),
         'ln_f.weight': (config.hidden_size,),
     }
-    
+
     for weight_name, expected_shape in expected_shapes.items():
         if weight_name in weights:
             actual_shape = weights[weight_name].shape
             if actual_shape != expected_shape:
                 logger.warning(f"Shape mismatch for {weight_name}: expected {expected_shape}, got {actual_shape}")
-    
+
     # Validate MoE-specific shapes if MoE is configured
     if config.moe.has_moe():
         num_experts = config.moe.num_experts
         intermediate_size = config.moe_intermediate_size
-        
+
         logger.info(f"Validating MoE shapes: {num_experts} experts, intermediate_size={intermediate_size}")
-        
+
         # Check if expert weights have expected stacked shapes
         for layer_idx in range(config.num_hidden_layers):
             tllm_prex = f'transformer.layers.{layer_idx}.'
-            
+
             # MoE expert weights should be stacked
             fc_weight_name = tllm_prex + 'mlp.fc.weight'
             proj_weight_name = tllm_prex + 'mlp.proj.weight'
-            
+
+            # Check if this is a dense layer or MoE layer
+            is_dense_layer = layer_idx < config.num_dense_layers
+
             if fc_weight_name in weights:
                 fc_shape = weights[fc_weight_name].shape
-                expected_fc_shape = (num_experts, config.hidden_size, 2 * intermediate_size)
+                if is_dense_layer:
+                    # Dense layer: fc_weight shape is (hidden_size, 2 * 3 * intermediate_size) = (1024, 6144)
+                    expected_fc_shape = (config.hidden_size, 6 * intermediate_size)
+                else:
+                    # MoE layer: fc_weight shape is (num_experts, hidden_size, 2 * intermediate_size)
+                    expected_fc_shape = (num_experts, config.hidden_size, 2 * intermediate_size)
                 if fc_shape != expected_fc_shape:
                     logger.warning(f"MoE FC shape mismatch in layer {layer_idx}: expected {expected_fc_shape}, got {fc_shape}")
-            
+
             if proj_weight_name in weights:
                 proj_shape = weights[proj_weight_name].shape
-                expected_proj_shape = (num_experts, intermediate_size, config.hidden_size)
+                if is_dense_layer:
+                    # Dense layer: proj_weight shape is (3 * intermediate_size, hidden_size) = (3072, 1024)
+                    expected_proj_shape = (3 * intermediate_size, config.hidden_size)
+                else:
+                    # MoE layer: proj_weight shape is (num_experts, intermediate_size, hidden_size)
+                    expected_proj_shape = (num_experts, intermediate_size, config.hidden_size)
                 if proj_shape != expected_proj_shape:
                     logger.warning(f"MoE proj shape mismatch in layer {layer_idx}: expected {expected_proj_shape}, got {proj_shape}")
 
@@ -182,7 +182,7 @@ def load_weights_from_hf_model(hf_model,
                                smoother: Optional[dict] = None):
     """
     Load weights from HuggingFace AFMoE model to TRT-LLM format
-    
+
     This function handles:
     - QKV concatenation
     - Expert stacking (128 experts)
@@ -223,64 +223,43 @@ def load_weights_from_hf_model(hf_model,
     layers_range = config.mapping.pp_layers(config.num_hidden_layers)
     exclude_layers_id = [0, config.num_hidden_layers - 1]
 
+    print(f"DEBUG: num_hidden_layers={config.num_hidden_layers}")
+    print(f"DEBUG: pp_size={config.mapping.pp_size}")
+    print(f"DEBUG: layers_range={layers_range}")
+    print(f"DEBUG: num_dense_layers={config.num_dense_layers}")
+
     model_prefix, layer_prefix, param_name_map = get_prefix_and_param_name_map(
         config.architecture)
 
     def convert_layer(l):
         """Convert a single layer from HF to TRT-LLM format"""
         prefix = f'{model_prefix}.{layer_prefix}.{l}.'
-        tllm_prex = f'transformer.layers.{l - layers_range[0]}.'
-        
+        tllm_prex = f'transformer.layers.{l}.'
+        has_moe_experts = l >= config.num_dense_layers  # Layers 2+ have MoE experts
+        has_shared_experts = l >= config.num_dense_layers  # Layers 2+ have shared_experts
+        has_router = l >= config.num_dense_layers  # Layers 2+ have router
+
         # ==============================================
         # ATTENTION LAYER CONVERSION
         # ==============================================
-        
-        # QKV concatenation (same as LLaMA)
-        q_weight = get_weight(
-            model_params, prefix + f'{param_name_map["attention.qkv"]}.q_proj',
-            dtype)
-        k_weight = get_weight(
-            model_params, prefix + f'{param_name_map["attention.qkv"]}.k_proj',
-            dtype)
-        v_weight = get_weight(
-            model_params, prefix + f'{param_name_map["attention.qkv"]}.v_proj',
-            dtype)
 
-        # Handle GQA for AFMoE
-        if not mha_mode:
-            if config.num_key_value_heads < mapping.tp_size:
-                # duplicate the KV heads up to tensor_parallel
-                k_weight = dup_kv_weight(k_weight, config.num_key_value_heads,
-                                         mapping.tp_size)
-                v_weight = dup_kv_weight(v_weight, config.num_key_value_heads,
-                                         mapping.tp_size)
-            assert (k_weight.shape[0] %
-                    (mapping.tp_size * config.head_size)) == 0
-            assert (v_weight.shape[0] %
-                    (mapping.tp_size * config.head_size)) == 0
+        # QKV weights
+        q_weight = get_weight(model_params, prefix + 'self_attn.q_proj', dtype)
+        k_weight = get_weight(model_params, prefix + 'self_attn.k_proj', dtype)
+        v_weight = get_weight(model_params, prefix + 'self_attn.v_proj', dtype)
 
-            wq = split(q_weight, mapping.tp_size, mapping.tp_rank)
-            wk = split(k_weight, mapping.tp_size, mapping.tp_rank)
-            wv = split(v_weight, mapping.tp_size, mapping.tp_rank)
-
-            split_v = torch.concat((wq, wk, wv))
-        else:
-            qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
-            split_v = split_qkv_tp(qkv_weight, config.num_attention_heads,
-                                   config.hidden_size, mapping.tp_size,
-                                   mapping.tp_rank)
+        # Handle attention: GQA with 8 Q heads and 2 KV heads
+        # For GQA, we split Q, K, V separately and concatenate
+        wq = split(q_weight, mapping.tp_size, mapping.tp_rank)
+        wk = split(k_weight, mapping.tp_size, mapping.tp_rank)
+        wv = split(v_weight, mapping.tp_size, mapping.tp_rank)
+        split_v = torch.concat((wq, wk, wv))
 
         # Handle QKV bias if present
-        if prefix + f'{param_name_map["attention.qkv"]}.q_proj.bias' in model_params:
-            q_bias = get_bias(
-                model_params,
-                prefix + f'{param_name_map["attention.qkv"]}.q_proj', dtype)
-            k_bias = get_bias(
-                model_params,
-                prefix + f'{param_name_map["attention.qkv"]}.k_proj', dtype)
-            v_bias = get_bias(
-                model_params,
-                prefix + f'{param_name_map["attention.qkv"]}.v_proj', dtype)
+        if prefix + 'self_attn.q_proj.bias' in model_params:
+            q_bias = get_bias(model_params, prefix + 'self_attn.q_proj', dtype)
+            k_bias = get_bias(model_params, prefix + 'self_attn.k_proj', dtype)
+            v_bias = get_bias(model_params, prefix + 'self_attn.v_proj', dtype)
             qkv_bias = torch.cat((q_bias, k_bias, v_bias))
             split_bias_v = split_qkv_bias_tp(qkv_bias,
                                              config.num_attention_heads,
@@ -295,81 +274,190 @@ def load_weights_from_hf_model(hf_model,
             weights[tllm_prex + 'attention.qkv.bias'] = split_bias_v
 
         # Attention dense layer
-        attn_dense_weight = get_weight(
-            model_params, prefix + param_name_map["attention.dense"], dtype)
+        attn_dense_weight = get_weight(model_params, prefix + 'self_attn.o_proj', dtype)
         split_v = split_matrix_tp(attn_dense_weight,
                                   mapping.tp_size,
                                   mapping.tp_rank,
                                   dim=1)
         weights[tllm_prex + 'attention.dense.weight'] = split_v
 
+        # Q/K norm (attention layer normalization - NOT q_layernorm)
+        q_norm_weight = get_weight(model_params, prefix + 'self_attn.q_norm', dtype)
+        k_norm_weight = get_weight(model_params, prefix + 'self_attn.k_norm', dtype)
+        if q_norm_weight is not None:
+            weights[tllm_prex + 'attention.q_layernorm.weight'] = q_norm_weight
+        if k_norm_weight is not None:
+            weights[tllm_prex + 'attention.k_layernorm.weight'] = k_norm_weight
+
         # ==============================================
-        # MoE LAYER CONVERSION (AFMoE Specific)
+        # MLP LAYER CONVERSION (AFMoE Specific)
         # ==============================================
-        
-        if moe_config.has_moe():
+
+        if has_moe_experts:
             logger.info(f"Converting MoE layer {l} with {moe_config.num_experts} experts")
-            
+
             # Get rank experts for this layer
             rank_experts = list(range(moe_config.num_experts))
             if mapping.has_moe_ep():
                 rank_experts = mapping.ep_experts(moe_config.num_experts)
-            
+
             # ==============================================
             # EXPERT WEIGHTS STACKING (128 experts)
             # ==============================================
-            
-            # Stack expert weights: w1, w2, w3 for each expert
+
+            # Stack expert weights: gate_proj, down_proj, up_proj for each expert
             expert_w1_weights = []  # gate_proj (first MLP)
-            expert_w2_weights = []  # down_proj (output projection)  
+            expert_w2_weights = []  # down_proj (output projection)
             expert_w3_weights = []  # up_proj (second MLP)
-            
+
             for expert_id in rank_experts:
-                # HF naming: model.layers.X.block_sparse_moe.experts.{expert_id}.{weight_name}.weight
-                expert_prefix = f'{prefix}block_sparse_moe.experts.{expert_id}.'
-                
+                # HF naming: model.layers.X.mlp.experts.{expert_id}.{weight_name}.weight
+                expert_prefix = f'{prefix}mlp.experts.{expert_id}.'
+
                 # Get expert weights
-                w1_weight = get_weight(model_params, expert_prefix + 'w1.weight', dtype)  # gate_proj
-                w2_weight = get_weight(model_params, expert_prefix + 'w2.weight', dtype)  # down_proj
-                w3_weight = get_weight(model_params, expert_prefix + 'w3.weight', dtype)  # up_proj
-                
+                # HF weights are already in correct shape for TRT-LLM:
+                # - gate_proj.weight: (256, 1024) = (intermediate_size, hidden_size) ✓
+                # - down_proj.weight: (1024, 256) = (hidden_size, intermediate_size) ✓
+                # - up_proj.weight: (256, 1024) = (intermediate_size, hidden_size) ✓
+                w1_weight = get_weight(model_params, expert_prefix + 'gate_proj', dtype)  # (intermediate, hidden)
+                w2_weight = get_weight(model_params, expert_prefix + 'down_proj', dtype)  # (hidden, intermediate)
+                w3_weight = get_weight(model_params, expert_prefix + 'up_proj', dtype)  # (intermediate, hidden)
+
                 expert_w1_weights.append(w1_weight)
-                expert_w2_weights.append(w2_weight) 
+                expert_w2_weights.append(w2_weight)
                 expert_w3_weights.append(w3_weight)
-            
-            # Stack expert weights: [num_experts, hidden_size, intermediate_size]
-            stacked_w1 = torch.stack(expert_w1_weights, dim=0)  # [num_experts, hidden_size, intermediate_size]
-            stacked_w2 = torch.stack(expert_w2_weights, dim=0)  # [num_experts, intermediate_size, hidden_size]
-            stacked_w3 = torch.stack(expert_w3_weights, dim=0)  # [num_experts, hidden_size, intermediate_size]
-            
+
+            # Stack expert weights: [num_experts, intermediate_size, hidden_size]
+            # w1 (gate_proj): (256, 1024) -> (128, 256, 1024) ✓
+            # w2 (down_proj): (1024, 256) -> (128, 1024, 256) ✓
+            # w3 (up_proj): (256, 1024) -> (128, 256, 1024) ✓
+            stacked_w1 = torch.stack(expert_w1_weights, dim=0)  # [num_experts, intermediate_size, hidden_size]
+            stacked_w2 = torch.stack(expert_w2_weights, dim=0)  # [num_experts, hidden_size, intermediate_size]
+            stacked_w3 = torch.stack(expert_w3_weights, dim=0)  # [num_experts, intermediate_size, hidden_size]
+
             # Apply tensor parallelism to expert weights
             if mapping.has_moe_tp():
                 # Split along intermediate_size dimension for TP
                 stacked_w1 = split(stacked_w1, mapping.moe_tp_size, mapping.moe_tp_rank, dim=1)
-                stacked_w2 = split(stacked_w2, mapping.moe_tp_size, mapping.moe_tp_rank, dim=1)  
+                stacked_w2 = split(stacked_w2, mapping.moe_tp_size, mapping.moe_tp_rank, dim=2)
                 stacked_w3 = split(stacked_w3, mapping.moe_tp_size, mapping.moe_tp_rank, dim=1)
-            
-            # Concatenate w3 and w1 for gate-up fusion: [num_experts, hidden_size, 2*intermediate_size]
-            fc_weight = torch.concat([stacked_w3, stacked_w1], dim=-1)  # gate-up fusion
-            proj_weight = stacked_w2
-            
-            # Store MoE expert weights
-            weights[tllm_prex + 'mlp.fc.weight'] = fc_weight.contiguous()
-            weights[tllm_prex + 'mlp.proj.weight'] = proj_weight.contiguous()
-            
-            # ==============================================
-            # SHARED EXPERT WEIGHTS (AFMoE Specific)
-            # ==============================================
-            
+
+            # GatedMLP uses separate fc and gate weights
+            weights[tllm_prex + 'mlp.fc.weight'] = stacked_w1.contiguous()
+            weights[tllm_prex + 'mlp.gate.weight'] = stacked_w3.contiguous()
+            weights[tllm_prex + 'mlp.proj.weight'] = stacked_w2.contiguous()
+
+        else:
+            # Dense MLP for first num_dense_layers (layers 0-1)
+            # HF naming: mlp.gate_proj, mlp.up_proj, mlp.down_proj
+            # HF weights are already in correct shape for TRT-LLM:
+            # - gate_proj.weight: (3072, 1024) = (ffn_hidden_size, hidden_size) ✓
+            # - up_proj.weight: (3072, 1024) = (ffn_hidden_size, hidden_size) ✓
+            # - down_proj.weight: (1024, 3072) = (hidden_size, ffn_hidden_size) ✓
+            gate_weight = get_weight(model_params, prefix + 'mlp.gate_proj', dtype)
+            up_weight = get_weight(model_params, prefix + 'mlp.up_proj', dtype)
+            down_weight = get_weight(model_params, prefix + 'mlp.down_proj', dtype)
+
+            # Apply TP to fc and gate (split along output dimension)
+            if mapping.has_moe_tp():
+                gate_weight = split(gate_weight, mapping.moe_tp_size, mapping.moe_tp_rank, dim=0)
+                up_weight = split(up_weight, mapping.moe_tp_size, mapping.moe_tp_rank, dim=0)
+                down_weight = split(down_weight, mapping.moe_tp_size, mapping.moe_tp_rank, dim=1)
+
+            # Store separate fc and gate weights for GatedMLP
+            weights[tllm_prex + 'mlp.fc.weight'] = gate_weight.contiguous()
+            weights[tllm_prex + 'mlp.gate.weight'] = up_weight.contiguous()
+            weights[tllm_prex + 'mlp.proj.weight'] = down_weight.contiguous()
+
+        # ==============================================
+        # SHARED EXPERT WEIGHTS (Only for MoE layers)
+        # ==============================================
+
+        if has_shared_experts:
             # AFMoE has shared experts that are always active
-            shared_expert_fc_weight = get_weight(
-                model_params, prefix + 'block_sparse_moe.shared_expert.up_proj', dtype)
-            shared_expert_proj_weight = get_weight(
-                model_params, prefix + 'block_sparse_moe.shared_expert.down_proj', dtype)
+            # HF naming: mlp.shared_experts.gate_proj, mlp.shared_experts.up_proj, mlp.shared_experts.down_proj
+            # HF weights are already in correct shape:
+            # - gate_proj.weight: (256, 1024) = (intermediate_size, hidden_size) ✓
+            # - up_proj.weight: (256, 1024) = (intermediate_size, hidden_size) ✓
+            # - down_proj.weight: (1024, 256) = (hidden_size, intermediate_size) ✓
+            # SharedMoE uses regular MLP with fused fc (gate+up concatenated)
             shared_expert_gate_weight = get_weight(
-                model_params, prefix + 'block_sparse_moe.shared_expert_gate', dtype)
-            
+                model_params, prefix + 'mlp.shared_experts.gate_proj', dtype)
+            shared_expert_fc_weight = get_weight(
+                model_params, prefix + 'mlp.shared_experts.up_proj', dtype)
+            shared_expert_proj_weight = get_weight(
+                model_params, prefix + 'mlp.shared_experts.down_proj', dtype)
+
             # Apply TP to shared expert weights
             if mapping.has_moe_tp():
-                shared_expert_fc_weight = split(shared_expert_fc_weight, mapping.moe_tp_size, mapping.moe_tp_rank, dim=1)
-                shared_expert_proj_weight = split(shared_expert_proj_weight, mapping.moe_tp_size, mapping.moe_tp_rank, dim=1
+                # fc is split along output dim (ffn_hidden_size * 2)
+                shared_expert_gate_weight = split(shared_expert_gate_weight, mapping.moe_tp_size, mapping.moe_tp_rank, dim=0)
+                shared_expert_fc_weight = split(shared_expert_fc_weight, mapping.moe_tp_size, mapping.moe_tp_rank, dim=0)
+                # proj is split along output dim (hidden_size)
+                shared_expert_proj_weight = split(shared_expert_proj_weight, mapping.moe_tp_size, mapping.moe_tp_rank, dim=0)
+
+            # Concatenate gate and up for gate-up fusion: (2 * intermediate, hidden)
+            shared_fc_weight = torch.concat([shared_expert_gate_weight, shared_expert_fc_weight], dim=0)
+
+            # Store shared expert weights
+            weights[tllm_prex + 'mlp.shared_expert.fc.weight'] = shared_fc_weight.contiguous()
+            weights[tllm_prex + 'mlp.shared_expert.proj.weight'] = shared_expert_proj_weight.contiguous()
+
+        # ==============================================
+        # ROUTER WEIGHTS (Only for MoE layers)
+        # ==============================================
+
+        if has_router:
+            # Router weights (never quantized) - HF naming: mlp.router.gate.weight
+            router_weight = get_weight(
+                model_params, prefix + 'mlp.router.gate', dtype)
+            weights[tllm_prex + 'mlp.router.weight'] = router_weight.contiguous()
+
+        # ==============================================
+        # LAYER NORMS
+        # ==============================================
+
+        # Input layernorm
+        input_layernorm_weight = get_weight(
+            model_params, prefix + 'input_layernorm', dtype)
+        weights[tllm_prex + 'input_layernorm.weight'] = input_layernorm_weight
+
+        # Post attention layernorm (named post_attention_layernorm in HF, maps to post_layernorm in TRT-LLM)
+        post_attention_layernorm_weight = get_weight(
+            model_params, prefix + 'post_attention_layernorm', dtype)
+        weights[tllm_prex + 'post_layernorm.weight'] = post_attention_layernorm_weight
+
+    # pp_layers returns a list of layer indices, iterate directly
+    for l in tqdm(layers_range, desc="Converting layers"):
+        convert_layer(l)
+
+    # ==============================================
+    # EMBEDDINGS AND OUTPUT
+    # ==============================================
+
+    # Vocab embedding - HF uses "model.embed_tokens"
+    vocab_embedding_weight = get_weight(
+        model_params, "model.embed_tokens", dtype)
+    if vocab_embedding_weight is not None:
+        weights['transformer.vocab_embedding.weight'] = vocab_embedding_weight
+
+    # Final layernorm - HF uses "model.norm"
+    ln_f_weight = get_weight(
+        model_params, "model.norm", dtype)
+    if ln_f_weight is not None:
+        weights['transformer.ln_f.weight'] = ln_f_weight
+
+    # LM head - HF uses "lm_head"
+    lm_head_weight = get_weight(
+        model_params, "lm_head", dtype)
+    if lm_head_weight is not None:
+        weights['lm_head.weight'] = lm_head_weight
+
+    tok = time.time()
+    t = time.strftime('%H:%M:%S', time.gmtime(tok - tik))
+    logger.info(f'Weights loaded. Total time: {t}')
+
+    # Validate tensor shapes
+    validate_tensor_shapes(weights, config)
+
+    return weights

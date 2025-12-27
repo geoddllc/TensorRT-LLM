@@ -29,6 +29,7 @@ from ..model_weights_loader import ModelWeightsLoader
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
                               QuantConfig)
 from .config import AfmoeConfig
+from .convert import load_hf_afmoe, load_weights_from_hf_model
 
 
 def MLPFactory(hidden_size,
@@ -125,7 +126,7 @@ class AfmoeDecoderLayer(Module):
             hidden_size=config.hidden_size,
             attention_head_size=config.head_size,
             num_attention_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
+            num_kv_heads=config.num_key_value_heads,  # Use actual KV heads for GQA
             max_seqlen_for_logn_scaling=config.seq_length,
             max_position_embeddings=config.max_position_embeddings,
             dtype=config.dtype,
@@ -140,44 +141,63 @@ class AfmoeDecoderLayer(Module):
             quant_mode=config.quant_mode,
             # Qwen3: Add Q/K layer normalization
             qk_layernorm=True,  # AFMoE uses Q/K normalization like Qwen3
-            layernorm_type=LayerNormType.RmsNorm,
-            # Sliding window attention support
-            sliding_window=config.sliding_window if use_sliding_attention else None)
+            layernorm_type=LayerNormType.RmsNorm)
 
         # Phase 3: Configure MoE parameters for AFMoE
         mlp_hidden_size = config.moe_intermediate_size if hasattr(config, 'moe_intermediate_size') else config.intermediate_size
         self.norm_before_bmm1 = config.norm_before_bmm1 if hasattr(
             config, "norm_before_bmm1") else False
 
-        # Create MoE configuration for AFMoE
-        # AFMoE uses: num_experts=128, top_k=8, num_shared_experts=1, sigmoid routing
-        moe_config = MoeConfig(
-            num_experts=128,
-            top_k=8,
-            shared_expert_intermediate_size=getattr(config, 'shared_expert_intermediate_size', 1408),
-            normalization_mode=MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE
-        )
-        moe_config.validate()
+        # Determine if this is a dense layer or MoE layer
+        num_dense_layers = getattr(config, 'num_dense_layers', 0)
+        is_dense_layer = layer_idx < num_dense_layers
+        
+        if is_dense_layer:
+            # Use dense MLP for the first num_dense_layers
+            self.mlp = MLPFactory(
+                hidden_size=config.hidden_size,
+                ffn_hidden_size=config.intermediate_size,
+                hidden_act=config.hidden_act,
+                dtype=config.dtype,
+                bias=config.mlp_bias,
+                moe_config=MoeConfig(),  # No MoE
+                tp_group=tp_group,
+                tp_size=tp_size,
+                mapping=config.mapping,
+                quant_mode=config.quant_mode,
+                inner_layernorm=inner_layernorm,
+                eps=config.norm_epsilon,
+            )
+        else:
+            # Create MoE configuration for AFMoE
+            # AFMoE uses: num_experts=128, top_k=8, num_shared_experts=1, sigmoid routing
+            moe_config = MoeConfig(
+                num_experts=128,
+                top_k=8,
+                shared_expert_intermediate_size=getattr(config, 'shared_expert_intermediate_size', 1408),
+                normalization_mode=MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE
+            )
+            moe_config.validate()
 
-        # Phase 3: Replace dense MLP with SharedMoE
-        self.mlp = MLPFactory(
-            hidden_size=config.hidden_size,
-            ffn_hidden_size=mlp_hidden_size,
-            hidden_act=config.hidden_act,
-            dtype=config.dtype,
-            bias=config.mlp_bias,
-            moe_config=moe_config,
-            tp_group=tp_group,
-            tp_size=tp_size,
-            mapping=config.mapping,
-            quant_mode=config.quant_mode,
-            inner_layernorm=inner_layernorm,
-            eps=config.norm_epsilon,
-            # Phase 3: SharedMoE parameters
-            use_shared_moe=True,
-            shared_expert_intermediate_size=getattr(config, 'shared_expert_intermediate_size', 1408),
-            use_shared_gate=True  # AFMoE uses shared gate for routing
-        )
+            # Phase 3: Replace dense MLP with SharedMoE
+            self.mlp = MLPFactory(
+                hidden_size=config.hidden_size,
+                ffn_hidden_size=mlp_hidden_size,
+                hidden_act=config.hidden_act,
+                dtype=config.dtype,
+                bias=config.mlp_bias,
+                moe_config=moe_config,
+                tp_group=tp_group,
+                tp_size=tp_size,
+                mapping=config.mapping,
+                quant_mode=config.quant_mode,
+                inner_layernorm=inner_layernorm,
+                eps=config.norm_epsilon,
+                # Phase 3: SharedMoE parameters
+                use_shared_moe=True,
+                shared_expert_intermediate_size=getattr(config, 'shared_expert_intermediate_size', 1408),
+                use_shared_gate=False  # Disable - HF model doesn't have this weight
+            )
 
         # Use RmsNorm like Qwen3
         self.post_layernorm = RmsNorm(normalized_shape=config.hidden_size,
@@ -374,12 +394,16 @@ class AfmoeForCausalLM(DecoderModelForCausalLM):
             # TODO: Implement prequantized weight loading for AFMoE
             raise NotImplementedError("Prequantized weight loading not implemented for AFMoE")
         else:
-            if not use_preloading:
-                # TODO: Implement HF model loading for AFMoE
-                raise NotImplementedError("HF model loading not implemented for AFMoE")
-            weights = {}  # Dummy weights for now
-            model = cls(config)
-            model.load(weights)
+            if use_preloading:
+                weights = {}  # Dummy weights for now
+                model = cls(config)
+                model.load(weights)
+            else:
+                hf_model = load_hf_afmoe(hf_model_dir, load_model_on_cpu)
+                weights = load_weights_from_hf_model(hf_model, config)
+                model = cls(config)
+                model.load(weights)
+                return model
         return model
 
     def use_lora(self, lora_config: LoraConfig):
